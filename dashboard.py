@@ -32,9 +32,10 @@ BASE_ID  = "appnhGIoeLSfLf9ah"
 TABLE_ID = "tblwZwNeuZwtIavqj"
 AT_HEADERS = {"Authorization": f"Bearer {TOKEN}"}
 
-BASE_DIR       = os.path.dirname(os.path.abspath(__file__))
-SNAPSHOT_DIR   = os.path.join(BASE_DIR, "snapshots")
-CHANGELOG_PATH = os.path.join(BASE_DIR, "changelog.csv")
+BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
+SNAPSHOT_DIR    = os.path.join(BASE_DIR, "snapshots")
+CHANGELOG_PATH  = os.path.join(BASE_DIR, "changelog.csv")
+SCORECARD_PATH  = os.path.join(BASE_DIR, "daily_scorecards.csv")
 
 NON_CREATOR_DOMAINS = {
     "periskope.app","accounts.google.com","apollo.io","mail.apollo.io","mail.anthropic.com",
@@ -187,6 +188,87 @@ def load_changelog():
     return df
 
 
+@st.cache_data(ttl=60)
+def load_scorecards():
+    if not os.path.exists(SCORECARD_PATH):
+        return pd.DataFrame()
+    df = pd.read_csv(SCORECARD_PATH)
+    df["date"] = pd.to_datetime(df["date"])
+    numeric_cols = [
+        "sod_needs_reply", "sod_needs_followup_1", "sod_needs_followup_2", "sod_needs_followup_3",
+        "sod_total", "new_inbounds", "replied", "followup_1_sent", "followup_2_sent",
+        "followup_3_sent", "total_actioned",
+        "reply_rate_pct", "fu1_rate_pct", "fu2_rate_pct", "fu3_rate_pct", "overall_rate_pct",
+    ]
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+    return df.sort_values("date")
+
+
+SCORECARD_FIELDS = [
+    "date", "saved_at",
+    "sod_needs_reply", "sod_needs_followup_1", "sod_needs_followup_2", "sod_needs_followup_3", "sod_total",
+    "new_inbounds",
+    "replied", "followup_1_sent", "followup_2_sent", "followup_3_sent", "total_actioned",
+    "reply_rate_pct", "fu1_rate_pct", "fu2_rate_pct", "fu3_rate_pct", "overall_rate_pct",
+]
+
+
+def write_scorecard_row(date_str, sod_snap, curr_snap):
+    """Compute metrics from SOD vs current diff and persist to daily_scorecards.csv."""
+    events = compute_intraday_events(sod_snap, curr_snap)
+
+    sod_nr  = sum(1 for r in sod_snap.values() if r["thread_status"] == "needs_reply")
+    sod_nf1 = sum(1 for r in sod_snap.values() if r["thread_status"] == "needs_followup_1")
+    sod_nf2 = sum(1 for r in sod_snap.values() if r["thread_status"] == "needs_followup_2")
+    sod_nf3 = sum(1 for r in sod_snap.values() if r["thread_status"] == "needs_followup_3")
+    sod_total = sod_nr + sod_nf1 + sod_nf2 + sod_nf3
+
+    replied        = events.get("replied", 0)
+    fu1            = events.get("followup_1_sent", 0)
+    fu2            = events.get("followup_2_sent", 0)
+    fu3            = events.get("followup_3_sent", 0)
+    total_actioned = replied + fu1 + fu2 + fu3
+
+    def rate(n, d):
+        return round(n / d * 100, 1) if d > 0 else 0.0
+
+    metrics = {
+        "date":                  date_str,
+        "saved_at":              datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        "sod_needs_reply":       sod_nr,
+        "sod_needs_followup_1":  sod_nf1,
+        "sod_needs_followup_2":  sod_nf2,
+        "sod_needs_followup_3":  sod_nf3,
+        "sod_total":             sod_total,
+        "new_inbounds":          events.get("new_inbound", 0),
+        "replied":               replied,
+        "followup_1_sent":       fu1,
+        "followup_2_sent":       fu2,
+        "followup_3_sent":       fu3,
+        "total_actioned":        total_actioned,
+        "reply_rate_pct":        rate(replied, sod_nr),
+        "fu1_rate_pct":          rate(fu1, sod_nf1),
+        "fu2_rate_pct":          rate(fu2, sod_nf2),
+        "fu3_rate_pct":          rate(fu3, sod_nf3),
+        "overall_rate_pct":      rate(total_actioned, sod_total),
+    }
+
+    rows = []
+    if os.path.exists(SCORECARD_PATH):
+        with open(SCORECARD_PATH, newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+    rows = [r for r in rows if r.get("date") != date_str]
+    rows.append(metrics)
+    rows.sort(key=lambda r: r["date"])
+    with open(SCORECARD_PATH, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=SCORECARD_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+    return metrics
+
+
 def pull_fresh_snapshot():
     """Pull live data from Airtable and save a new snapshot."""
     all_records = []
@@ -289,18 +371,38 @@ with st.sidebar:
     st.divider()
     page = st.radio(
         "View",
-        ["📅  Today's Scorecard", "📊  Queue Overview", "📈  Trends & Execution", "📋  Changelog", "🔍  Inbox Drill-Down"],
+        ["📅  Today's Scorecard", "📊  Queue Overview", "📈  Trends & Execution",
+         "📋  Changelog", "🔍  Inbox Drill-Down", "🏆  Historical Performance"],
         label_visibility="collapsed",
     )
     st.divider()
+
+    if st.button("🔒  Lock EOD Scorecard", use_container_width=True,
+                 help="Save today's execution metrics to the historical record"):
+        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        sod_snap, _ = load_sod_snapshot()
+        curr_snap, _ = load_latest_snapshot()
+        if not sod_snap:
+            st.warning("No SOD baseline for today — refresh first.")
+        else:
+            metrics = write_scorecard_row(today_str, sod_snap, curr_snap)
+            st.cache_data.clear()
+            st.success(
+                f"Scorecard locked for {today_str}: "
+                f"{metrics['total_actioned']} actioned / {metrics['sod_total']} SOD "
+                f"({metrics['overall_rate_pct']}%)"
+            )
+            st.rerun()
+
     st.caption(f"Data dir: `airtable-visibility-tracker/`")
 
 # ── Load data ─────────────────────────────────────────────────────────────────
 
-snapshot, snap_date = load_latest_snapshot()
-changelog_df        = load_changelog()
-all_snaps           = load_all_snapshots()
+snapshot, snap_date    = load_latest_snapshot()
+changelog_df           = load_changelog()
+all_snaps              = load_all_snapshots()
 sod_snapshot, sod_date = load_sod_snapshot()
+scorecards_df          = load_scorecards()
 
 if not snapshot:
     st.error("No snapshot found. Click 'Refresh from Airtable' to load data.")
@@ -856,3 +958,154 @@ elif page == "🔍  Inbox Drill-Down":
             use_container_width=True,
             height=280,
         )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE 5: Historical Performance
+# ══════════════════════════════════════════════════════════════════════════════
+
+elif page == "🏆  Historical Performance":
+    st.title("🏆 Historical Performance")
+    st.caption("Day-by-day execution rate — locked each evening via the sidebar button or EOD tracker.")
+    st.divider()
+
+    if scorecards_df.empty:
+        st.info(
+            "No historical data yet. At the end of each day, click **Lock EOD Scorecard** "
+            "in the sidebar (or the 8pm launchd job will do it automatically)."
+        )
+        st.stop()
+
+    # ── Summary KPI row (all-time averages) ───────────────────────────────────
+    avg_overall  = scorecards_df["overall_rate_pct"].mean()
+    avg_reply    = scorecards_df["reply_rate_pct"].mean()
+    avg_fu1      = scorecards_df["fu1_rate_pct"].mean()
+    best_day     = scorecards_df.loc[scorecards_df["overall_rate_pct"].idxmax(), "date"].strftime("%b %d")
+    total_days   = len(scorecards_df)
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    for col, label, val, colour in [
+        (c1, "Avg Overall Rate",   f"{avg_overall:.1f}%",  "#2F5496"),
+        (c2, "Avg Reply Rate",     f"{avg_reply:.1f}%",    "#E74C3C"),
+        (c3, "Avg FU1 Rate",       f"{avg_fu1:.1f}%",      "#F39C12"),
+        (c4, "Best Day",           best_day,               "#27AE60"),
+        (c5, "Days Tracked",       str(total_days),        "#555555"),
+    ]:
+        col.markdown(f"""
+        <div class="metric-card">
+            <p class="metric-number" style="color:{colour}">{val}</p>
+            <p class="metric-label">{label}</p>
+        </div>""", unsafe_allow_html=True)
+
+    st.divider()
+
+    # ── Execution rate over time ───────────────────────────────────────────────
+    st.markdown('<p class="section-header">Execution Rate Over Time</p>', unsafe_allow_html=True)
+
+    rate_trend = scorecards_df[["date", "overall_rate_pct", "reply_rate_pct", "fu1_rate_pct",
+                                 "fu2_rate_pct", "fu3_rate_pct"]].copy()
+    rate_trend = rate_trend.melt(id_vars="date", var_name="metric", value_name="rate")
+    rate_label_map = {
+        "overall_rate_pct": "Overall",
+        "reply_rate_pct":   "Reply (needs_reply)",
+        "fu1_rate_pct":     "Followup 1",
+        "fu2_rate_pct":     "Followup 2",
+        "fu3_rate_pct":     "Followup 3",
+    }
+    rate_colour_map = {
+        "Overall":              "#2F5496",
+        "Reply (needs_reply)":  "#E74C3C",
+        "Followup 1":           "#F39C12",
+        "Followup 2":           "#3498DB",
+        "Followup 3":           "#9B59B6",
+    }
+    rate_trend["label"] = rate_trend["metric"].map(rate_label_map)
+
+    fig_rate = px.line(
+        rate_trend, x="date", y="rate", color="label",
+        color_discrete_map=rate_colour_map,
+        markers=True,
+        labels={"rate": "Execution Rate (%)", "date": "Date", "label": ""},
+    )
+    fig_rate.add_hline(y=50, line_dash="dot", line_color="#aaa",
+                       annotation_text="50% target", annotation_position="top right")
+    fig_rate.update_layout(
+        height=360, margin=dict(l=0, r=0, t=10, b=0),
+        plot_bgcolor="white", paper_bgcolor="white",
+        yaxis=dict(ticksuffix="%", range=[0, 110], showgrid=True, gridcolor="#f0f0f0"),
+        xaxis=dict(showgrid=False),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    )
+    st.plotly_chart(fig_rate, use_container_width=True)
+
+    st.divider()
+
+    # ── Volume actioned per day ────────────────────────────────────────────────
+    st.markdown('<p class="section-header">Volume Actioned Per Day</p>', unsafe_allow_html=True)
+
+    vol_df = scorecards_df[["date", "replied", "followup_1_sent", "followup_2_sent",
+                              "followup_3_sent", "new_inbounds"]].copy()
+    vol_melt = vol_df.melt(id_vars="date", var_name="type", value_name="count")
+    vol_label_map = {
+        "replied":         "Replies Sent",
+        "followup_1_sent": "Followup 1 Sent",
+        "followup_2_sent": "Followup 2 Sent",
+        "followup_3_sent": "Followup 3 Sent",
+        "new_inbounds":    "New Inbounds",
+    }
+    vol_colour_map = {
+        "Replies Sent":    "#27AE60",
+        "Followup 1 Sent": "#3498DB",
+        "Followup 2 Sent": "#9B59B6",
+        "Followup 3 Sent": "#E74C3C",
+        "New Inbounds":    "#F39C12",
+    }
+    vol_melt["label"] = vol_melt["type"].map(vol_label_map)
+
+    fig_vol = px.bar(
+        vol_melt, x="date", y="count", color="label",
+        color_discrete_map=vol_colour_map,
+        labels={"count": "Count", "date": "Date", "label": ""},
+        barmode="stack",
+    )
+    fig_vol.update_layout(
+        height=320, margin=dict(l=0, r=0, t=10, b=0),
+        plot_bgcolor="white", paper_bgcolor="white",
+        xaxis=dict(showgrid=False),
+        yaxis=dict(showgrid=True, gridcolor="#f0f0f0"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    )
+    st.plotly_chart(fig_vol, use_container_width=True)
+
+    st.divider()
+
+    # ── Full historical table ──────────────────────────────────────────────────
+    st.markdown('<p class="section-header">Full Historical Scorecard Table</p>', unsafe_allow_html=True)
+
+    display_sc = scorecards_df.copy().sort_values("date", ascending=False)
+    display_sc["date"] = display_sc["date"].dt.strftime("%Y-%m-%d")
+    rename_map = {
+        "date":                 "Date",
+        "sod_needs_reply":      "SOD Reply",
+        "sod_needs_followup_1": "SOD FU1",
+        "sod_needs_followup_2": "SOD FU2",
+        "sod_needs_followup_3": "SOD FU3",
+        "sod_total":            "SOD Total",
+        "new_inbounds":         "New In",
+        "replied":              "Replied",
+        "followup_1_sent":      "FU1 Sent",
+        "followup_2_sent":      "FU2 Sent",
+        "followup_3_sent":      "FU3 Sent",
+        "total_actioned":       "Total Actioned",
+        "reply_rate_pct":       "Reply %",
+        "fu1_rate_pct":         "FU1 %",
+        "fu2_rate_pct":         "FU2 %",
+        "fu3_rate_pct":         "FU3 %",
+        "overall_rate_pct":     "Overall %",
+        "saved_at":             "Locked At",
+    }
+    display_sc = display_sc.rename(columns=rename_map)
+    show_cols = ["Date", "SOD Total", "New In", "Replied", "FU1 Sent", "FU2 Sent", "FU3 Sent",
+                 "Total Actioned", "Reply %", "FU1 %", "FU2 %", "Overall %", "Locked At"]
+    show_cols = [c for c in show_cols if c in display_sc.columns]
+    st.dataframe(display_sc[show_cols].set_index("Date"), use_container_width=True, height=400)

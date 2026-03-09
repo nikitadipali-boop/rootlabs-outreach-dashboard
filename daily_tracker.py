@@ -41,12 +41,21 @@ BASE_ID  = "appnhGIoeLSfLf9ah"
 TABLE_ID = "tblwZwNeuZwtIavqj"
 HEADERS  = {"Authorization": f"Bearer {TOKEN}"}
 
-BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
-SNAPSHOT_DIR  = os.path.join(BASE_DIR, "snapshots")
-CHANGELOG_PATH = os.path.join(BASE_DIR, "changelog.csv")
-SUMMARY_PATH   = os.path.join(BASE_DIR, "daily_summary.xlsx")
+BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
+SNAPSHOT_DIR    = os.path.join(BASE_DIR, "snapshots")
+CHANGELOG_PATH  = os.path.join(BASE_DIR, "changelog.csv")
+SUMMARY_PATH    = os.path.join(BASE_DIR, "daily_summary.xlsx")
+SCORECARD_PATH  = os.path.join(BASE_DIR, "daily_scorecards.csv")
 
 os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+
+SCORECARD_FIELDS = [
+    "date", "saved_at",
+    "sod_needs_reply", "sod_needs_followup_1", "sod_needs_followup_2", "sod_needs_followup_3", "sod_total",
+    "new_inbounds",
+    "replied", "followup_1_sent", "followup_2_sent", "followup_3_sent", "total_actioned",
+    "reply_rate_pct", "fu1_rate_pct", "fu2_rate_pct", "fu3_rate_pct", "overall_rate_pct",
+]
 
 NON_CREATOR_DOMAINS = {
     "periskope.app","accounts.google.com","apollo.io","mail.apollo.io","mail.anthropic.com",
@@ -490,45 +499,167 @@ def build_summary_excel(current_snapshot, changelog_rows):
     print(f"  Saved: {SUMMARY_PATH}")
 
 
+# ── Scorecard ─────────────────────────────────────────────────────────────────
+
+def compute_scorecard_metrics(date_str, sod_snap, curr_snap):
+    """Compute full daily scorecard metrics by diffing SOD vs current snapshot."""
+    new_inbound = 0
+    replied = followup_1_sent = followup_2_sent = followup_3_sent = 0
+
+    sod_ids  = set(sod_snap.keys())
+    curr_ids = set(curr_snap.keys())
+
+    for rid in curr_ids - sod_ids:
+        if curr_snap[rid].get("last_message_type") == "inbound":
+            new_inbound += 1
+
+    for rid, sod_rec in sod_snap.items():
+        if rid not in curr_snap:
+            continue
+        curr_rec = curr_snap[rid]
+        p_status = sod_rec["thread_status"]
+        c_status = curr_rec["thread_status"]
+        p_action = sod_rec["action_status_final"]
+        c_action = curr_rec["action_status_final"]
+        p_date   = sod_rec["last_message_date"]
+        c_date   = curr_rec["last_message_date"]
+
+        if (p_status != "needs_reply" and c_status == "needs_reply"
+                and c_date != p_date and curr_rec.get("last_message_type") == "inbound"):
+            new_inbound += 1
+        if p_status == "needs_reply" and c_action == "done_reply" and p_action != "done_reply":
+            replied += 1
+        if p_action == "done_reply" and c_action == "done_followup_1":
+            followup_1_sent += 1
+        if p_action == "done_followup_1" and c_action == "done_followup_2":
+            followup_2_sent += 1
+        if p_action == "done_followup_2" and c_action == "done_followup_3":
+            followup_3_sent += 1
+
+    sod_nr  = sum(1 for r in sod_snap.values() if r["thread_status"] == "needs_reply")
+    sod_nf1 = sum(1 for r in sod_snap.values() if r["thread_status"] == "needs_followup_1")
+    sod_nf2 = sum(1 for r in sod_snap.values() if r["thread_status"] == "needs_followup_2")
+    sod_nf3 = sum(1 for r in sod_snap.values() if r["thread_status"] == "needs_followup_3")
+    sod_total = sod_nr + sod_nf1 + sod_nf2 + sod_nf3
+    total_actioned = replied + followup_1_sent + followup_2_sent + followup_3_sent
+
+    def rate(n, d):
+        return round(n / d * 100, 1) if d > 0 else 0.0
+
+    return {
+        "date":                  date_str,
+        "saved_at":              datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        "sod_needs_reply":       sod_nr,
+        "sod_needs_followup_1":  sod_nf1,
+        "sod_needs_followup_2":  sod_nf2,
+        "sod_needs_followup_3":  sod_nf3,
+        "sod_total":             sod_total,
+        "new_inbounds":          new_inbound,
+        "replied":               replied,
+        "followup_1_sent":       followup_1_sent,
+        "followup_2_sent":       followup_2_sent,
+        "followup_3_sent":       followup_3_sent,
+        "total_actioned":        total_actioned,
+        "reply_rate_pct":        rate(replied, sod_nr),
+        "fu1_rate_pct":          rate(followup_1_sent, sod_nf1),
+        "fu2_rate_pct":          rate(followup_2_sent, sod_nf2),
+        "fu3_rate_pct":          rate(followup_3_sent, sod_nf3),
+        "overall_rate_pct":      rate(total_actioned, sod_total),
+    }
+
+
+def save_scorecard_row(metrics):
+    """Append or overwrite today's row in daily_scorecards.csv."""
+    date_str = metrics["date"]
+    rows = []
+    if os.path.exists(SCORECARD_PATH):
+        with open(SCORECARD_PATH, newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+    rows = [r for r in rows if r.get("date") != date_str]
+    rows.append(metrics)
+    rows.sort(key=lambda r: r["date"])
+    with open(SCORECARD_PATH, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=SCORECARD_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"  Scorecard row saved for {date_str} -> {SCORECARD_PATH}")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    import sys
+    eod_mode = "--eod" in sys.argv
+
     print("=" * 60)
-    print("Daily Outreach Tracker")
+    if eod_mode:
+        print("Daily Outreach Tracker — EOD Scorecard Mode")
+    else:
+        print("Daily Outreach Tracker — Morning Run")
     print(f"Run time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
     print("=" * 60)
 
-    # 1. Pull fresh snapshot
-    curr_snapshot, today = pull_snapshot()
+    if eod_mode:
+        # ── EOD: save scorecard only, do not touch changelog ─────────────────
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        sod_path = os.path.join(SNAPSHOT_DIR, f"snapshot_{today}_sod.json")
+        if not os.path.exists(sod_path):
+            print("ERROR: No SOD snapshot found for today. Run the morning tracker first.")
+            sys.exit(1)
+        with open(sod_path) as fh:
+            sod_snap = json.load(fh)
+        print(f"  SOD baseline loaded: {len(sod_snap)} records")
 
-    # 2. Load previous snapshot
-    print("\nLoading previous snapshot...")
-    prev_snapshot = load_previous_snapshot(today)
+        print("\nPulling current Airtable state for EOD diff...")
+        curr_snapshot, _ = pull_snapshot()
 
-    # 3. Diff
-    print("\nDetecting changes...")
-    events = diff_snapshots(prev_snapshot, curr_snapshot, today)
-    print(f"  {len(events)} change events detected")
-    if events:
-        from collections import Counter
-        for etype, count in Counter(e["event_type"] for e in events).most_common():
-            print(f"    {etype}: {count}")
+        print("\nComputing EOD scorecard...")
+        metrics = compute_scorecard_metrics(today, sod_snap, curr_snapshot)
+        save_scorecard_row(metrics)
 
-    # 4. Append changelog
-    print("\nUpdating changelog...")
-    append_changelog(events)
+        print(f"\n{'─' * 40}")
+        print(f"  EOD Scorecard — {today}")
+        print(f"{'─' * 40}")
+        print(f"  SOD total queue:   {metrics['sod_total']}")
+        print(f"  New inbounds:      {metrics['new_inbounds']}")
+        print(f"  Replies sent:      {metrics['replied']}  ({metrics['reply_rate_pct']}% of needs_reply)")
+        print(f"  Followup 1 sent:   {metrics['followup_1_sent']}  ({metrics['fu1_rate_pct']}% of FU1 queue)")
+        print(f"  Followup 2 sent:   {metrics['followup_2_sent']}  ({metrics['fu2_rate_pct']}% of FU2 queue)")
+        print(f"  Total actioned:    {metrics['total_actioned']}  ({metrics['overall_rate_pct']}% overall)")
+        print(f"{'─' * 40}")
 
-    # 5. Load full changelog
-    changelog = load_changelog()
-    print(f"  Total changelog entries so far: {len(changelog)}")
+    else:
+        # ── Morning run: snapshot + changelog + Excel ─────────────────────────
+        # 1. Pull fresh snapshot
+        curr_snapshot, today = pull_snapshot()
 
-    # 6. Build Excel
-    print("\nBuilding summary Excel...")
-    build_summary_excel(curr_snapshot, changelog)
+        # 2. Load previous snapshot
+        print("\nLoading previous snapshot...")
+        prev_snapshot = load_previous_snapshot(today)
 
-    print("\n" + "=" * 60)
-    print("Done.")
-    print(f"  Queue snapshot:  snapshots/snapshot_{today}.json")
-    print(f"  Changelog:       changelog.csv")
-    print(f"  Summary Excel:   daily_summary.xlsx")
-    print("=" * 60)
+        # 3. Diff
+        print("\nDetecting changes...")
+        events = diff_snapshots(prev_snapshot, curr_snapshot, today)
+        print(f"  {len(events)} change events detected")
+        if events:
+            for etype, count in Counter(e["event_type"] for e in events).most_common():
+                print(f"    {etype}: {count}")
+
+        # 4. Append changelog
+        print("\nUpdating changelog...")
+        append_changelog(events)
+
+        # 5. Load full changelog
+        changelog = load_changelog()
+        print(f"  Total changelog entries so far: {len(changelog)}")
+
+        # 6. Build Excel
+        print("\nBuilding summary Excel...")
+        build_summary_excel(curr_snapshot, changelog)
+
+        print("\n" + "=" * 60)
+        print("Done.")
+        print(f"  Queue snapshot:  snapshots/snapshot_{today}.json")
+        print(f"  Changelog:       changelog.csv")
+        print(f"  Summary Excel:   daily_summary.xlsx")
+        print("=" * 60)
