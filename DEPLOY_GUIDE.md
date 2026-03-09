@@ -47,29 +47,26 @@ Enter your GitHub username and password when prompted.
    ```
 7. Click **Save** then **Deploy**
 
-Streamlit will build the app (takes ~2 minutes). You'll get a public URL like:
-`https://YOUR_USERNAME-rootlabs-outreach-dashboard-dashboard-XXXX.streamlit.app`
+Live URL:
+**https://rootlabs-outreach-dashboard-andnfravburjolrptdgym3.streamlit.app**
 
 Bookmark that URL. It is accessible from any device, any browser - phone included.
 
 ---
 
-## Step 4 - Keep data up to date (daily push)
+## Step 4 - Keep data up to date (daily run)
 
-The changelog and snapshots live in the repo. Every time you run the daily tracker,
-push the updated files to GitHub so the cloud dashboard picks up the latest data.
-
-Add this to the end of your daily routine:
+Snapshots and changelog are stored locally only (not in GitHub).
+Run this once a day - the cloud dashboard pulls live from Airtable on every page load,
+and the local files build up your historical trend data over time.
 
 ```bash
 cd ~/Desktop/apollo-analytics/airtable-visibility-tracker
 python3 daily_tracker.py
-git add changelog.csv snapshots/
-git commit -m "Daily update $(date +%Y-%m-%d)"
-git push
 ```
 
-Or save that as a shell script `push_update.sh` and double-click it each morning.
+The cloud dashboard's Refresh button also pulls fresh data directly from Airtable
+without needing a script run.
 
 ---
 
