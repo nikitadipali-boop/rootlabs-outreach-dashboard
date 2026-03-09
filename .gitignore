@@ -1,0 +1,12 @@
+# Secrets - never commit
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+
+# Large raw data files (keep snapshots and changelog for history)
+*.json.bak
+apollo_emails_raw_*.json
