@@ -298,11 +298,14 @@ def pull_fresh_snapshot():
             continue
         if (f.get("action_status_manual") or "") == "needs_no_action":
             continue
+        thread_status = (f.get("thread_status") or "").strip()
+        if not thread_status:
+            continue
         snapshot[r["id"]] = {
             "record_id":           r["id"],
             "creator_email":       email,
             "rootlabs_inbox":      (f.get("rootlabs_email") or "").strip(),
-            "thread_status":       (f.get("thread_status") or "").strip(),
+            "thread_status":       thread_status,
             "action_status_final": (f.get("action_status_final") or "").strip(),
             "last_message_type":   (f.get("last_message_type") or "").strip(),
             "last_message_date":   (f.get("last_message_date") or "")[:19],
@@ -366,6 +369,17 @@ with st.sidebar:
             pull_fresh_snapshot()
         st.cache_data.clear()
         st.success("Data refreshed!")
+        st.rerun()
+
+    if st.button("📍  Reset SOD Baseline to Now", use_container_width=True,
+                 help="Use after bulk Airtable updates. Re-anchors today's start-of-day baseline to current live data."):
+        with st.spinner("Pulling live data and resetting SOD baseline..."):
+            snapshot, today = pull_fresh_snapshot()
+            sod_path = os.path.join(SNAPSHOT_DIR, f"snapshot_{today}_sod.json")
+            with open(sod_path, "w") as fh:
+                json.dump(snapshot, fh, indent=2)
+        st.cache_data.clear()
+        st.success(f"SOD baseline reset to {len(snapshot):,} threads.")
         st.rerun()
 
     st.divider()
