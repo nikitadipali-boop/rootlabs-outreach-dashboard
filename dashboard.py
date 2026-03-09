@@ -82,11 +82,16 @@ EVENT_LABELS = {
 
 # ── Data loaders ──────────────────────────────────────────────────────────────
 
+def _is_daily_snapshot(fname):
+    """True only for snapshot_YYYY-MM-DD.json, not _sod variants."""
+    import re
+    return bool(re.match(r'^snapshot_\d{4}-\d{2}-\d{2}\.json$', fname))
+
+
 @st.cache_data(ttl=300)
 def load_latest_snapshot():
     files = sorted([
-        f for f in os.listdir(SNAPSHOT_DIR)
-        if f.startswith("snapshot_") and f.endswith(".json")
+        f for f in os.listdir(SNAPSHOT_DIR) if _is_daily_snapshot(f)
     ], reverse=True)
     if not files:
         return {}, "No snapshot found"
@@ -98,11 +103,22 @@ def load_latest_snapshot():
 
 
 @st.cache_data(ttl=300)
+def load_sod_snapshot():
+    """Load today's SOD (start-of-day) baseline snapshot, if it exists."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    sod_path = os.path.join(SNAPSHOT_DIR, f"snapshot_{today}_sod.json")
+    if not os.path.exists(sod_path):
+        return {}, None
+    with open(sod_path) as f:
+        data = json.load(f)
+    return data, today
+
+
+@st.cache_data(ttl=300)
 def load_all_snapshots():
-    """Load all snapshots and return a dict of {date: snapshot}."""
+    """Load all daily snapshots (excludes _sod variants) as {date: snapshot}."""
     files = sorted([
-        f for f in os.listdir(SNAPSHOT_DIR)
-        if f.startswith("snapshot_") and f.endswith(".json")
+        f for f in os.listdir(SNAPSHOT_DIR) if _is_daily_snapshot(f)
     ])
     all_snaps = {}
     for fname in files:
@@ -110,6 +126,56 @@ def load_all_snapshots():
         with open(os.path.join(SNAPSHOT_DIR, fname)) as f:
             all_snaps[date_str] = json.load(f)
     return all_snaps
+
+
+def compute_intraday_events(sod_snap, curr_snap):
+    """
+    Diff SOD snapshot vs current snapshot to get intra-day action counts.
+    Returns a Counter of event_type -> count.
+    """
+    events = Counter()
+    sod_ids  = set(sod_snap.keys())
+    curr_ids = set(curr_snap.keys())
+
+    # Brand-new threads not present at SOD
+    for rid in curr_ids - sod_ids:
+        if curr_snap[rid]["last_message_type"] == "inbound":
+            events["new_inbound"] += 1
+
+    # State transitions on existing threads
+    for rid, sod_rec in sod_snap.items():
+        if rid not in curr_snap:
+            continue  # removed / marked needs_no_action manually
+        curr_rec = curr_snap[rid]
+        p_status = sod_rec["thread_status"]
+        c_status = curr_rec["thread_status"]
+        p_action = sod_rec["action_status_final"]
+        c_action = curr_rec["action_status_final"]
+        p_date   = sod_rec["last_message_date"]
+        c_date   = curr_rec["last_message_date"]
+
+        # New inbound on existing thread (creator replied back during the day)
+        if (p_status != "needs_reply" and c_status == "needs_reply"
+                and c_date != p_date and curr_rec["last_message_type"] == "inbound"):
+            events["new_inbound"] += 1
+
+        # Reply sent (needs_reply -> done_reply)
+        if p_status == "needs_reply" and c_action == "done_reply" and p_action != "done_reply":
+            events["replied"] += 1
+
+        # Followup 1 sent
+        if p_action == "done_reply" and c_action == "done_followup_1":
+            events["followup_1_sent"] += 1
+
+        # Followup 2 sent
+        if p_action == "done_followup_1" and c_action == "done_followup_2":
+            events["followup_2_sent"] += 1
+
+        # Followup 3 sent
+        if p_action == "done_followup_2" and c_action == "done_followup_3":
+            events["followup_3_sent"] += 1
+
+    return events
 
 
 @st.cache_data(ttl=300)
@@ -166,6 +232,13 @@ def pull_fresh_snapshot():
     snap_path = os.path.join(SNAPSHOT_DIR, f"snapshot_{today}.json")
     with open(snap_path, "w") as fh:
         json.dump(snapshot, fh, indent=2)
+
+    # Save immutable SOD baseline (never overwrite once created for the day)
+    sod_path = os.path.join(SNAPSHOT_DIR, f"snapshot_{today}_sod.json")
+    if not os.path.exists(sod_path):
+        with open(sod_path, "w") as fh:
+            json.dump(snapshot, fh, indent=2)
+
     return snapshot, today
 
 
@@ -216,7 +289,7 @@ with st.sidebar:
     st.divider()
     page = st.radio(
         "View",
-        ["📊  Queue Overview", "📈  Trends & Execution", "📋  Changelog", "🔍  Inbox Drill-Down"],
+        ["📅  Today's Scorecard", "📊  Queue Overview", "📈  Trends & Execution", "📋  Changelog", "🔍  Inbox Drill-Down"],
         label_visibility="collapsed",
     )
     st.divider()
@@ -227,6 +300,7 @@ with st.sidebar:
 snapshot, snap_date = load_latest_snapshot()
 changelog_df        = load_changelog()
 all_snaps           = load_all_snapshots()
+sod_snapshot, sod_date = load_sod_snapshot()
 
 if not snapshot:
     st.error("No snapshot found. Click 'Refresh from Airtable' to load data.")
@@ -238,10 +312,180 @@ snap_df = snap_df[snap_df["thread_status"].isin([
 ])]
 
 # ══════════════════════════════════════════════════════════════════════════════
+# PAGE 0: Today's Scorecard
+# ══════════════════════════════════════════════════════════════════════════════
+
+if page == "📅  Today's Scorecard":
+    st.title("📅 Today's Scorecard")
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    st.caption(f"Date: **{today_str}**  ·  Measures execution from SOD baseline to now")
+    st.divider()
+
+    if not sod_snapshot:
+        st.warning(
+            "No SOD baseline found for today. "
+            "Click **Refresh from Airtable** once — it will save today's baseline automatically. "
+            "From tomorrow onward, the 8am scheduled run sets the baseline."
+        )
+        st.stop()
+
+    # ── Compute SOD queue counts ──────────────────────────────────────────────
+    STATUS_KEYS = ["needs_reply", "needs_followup_1", "needs_followup_2", "needs_followup_3"]
+    STATUS_DISPLAY = {
+        "needs_reply":       "Needs Reply",
+        "needs_followup_1":  "Needs Followup 1",
+        "needs_followup_2":  "Needs Followup 2",
+        "needs_followup_3":  "Needs Followup 3",
+    }
+    STATUS_COLORS = {
+        "needs_reply":       "#E74C3C",
+        "needs_followup_1":  "#F39C12",
+        "needs_followup_2":  "#3498DB",
+        "needs_followup_3":  "#9B59B6",
+    }
+    ACTION_FOR_STATUS = {
+        "needs_reply":       "replied",
+        "needs_followup_1":  "followup_1_sent",
+        "needs_followup_2":  "followup_2_sent",
+        "needs_followup_3":  "followup_3_sent",
+    }
+
+    sod_counts = {s: sum(1 for r in sod_snapshot.values() if r["thread_status"] == s) for s in STATUS_KEYS}
+    now_counts  = {s: len(snap_df[snap_df["thread_status"] == s]) for s in STATUS_KEYS}
+
+    # Actions taken today — computed live from SOD vs current snapshot diff
+    intraday = compute_intraday_events(sod_snapshot, snapshot)
+    today_actions = {v: intraday.get(v, 0) for v in ACTION_FOR_STATUS.values()}
+    new_inbounds_today = intraday.get("new_inbound", 0)
+
+    # ── Top summary row ───────────────────────────────────────────────────────
+    total_sod     = sum(sod_counts.values())
+    total_now     = sum(now_counts.values())
+    total_actioned = sum(today_actions.values())
+    overall_rate  = round(total_actioned / total_sod * 100, 1) if total_sod > 0 else 0
+
+    c1, c2, c3, c4 = st.columns(4)
+    for col, label, val, colour in [
+        (c1, "SOD Queue Total",   total_sod,      "#2F5496"),
+        (c2, "Current Queue",     total_now,      "#555555"),
+        (c3, "Actions Taken",     total_actioned, "#27AE60"),
+        (c4, "New Inbounds",      new_inbounds_today, "#F39C12"),
+    ]:
+        col.markdown(f"""
+        <div class="metric-card">
+            <p class="metric-number" style="color:{colour}">{val}</p>
+            <p class="metric-label">{label}</p>
+        </div>""", unsafe_allow_html=True)
+
+    st.divider()
+
+    # ── Per-queue scorecard ───────────────────────────────────────────────────
+    st.markdown('<p class="section-header">Queue-by-Queue Execution</p>', unsafe_allow_html=True)
+
+    scorecard_rows = []
+    for s in STATUS_KEYS:
+        sod_n   = sod_counts[s]
+        now_n   = now_counts[s]
+        actioned = today_actions.get(ACTION_FOR_STATUS[s], 0)
+        rate    = round(actioned / sod_n * 100, 1) if sod_n > 0 else 0.0
+        delta   = now_n - sod_n   # positive = queue grew, negative = queue shrank
+        scorecard_rows.append({
+            "Queue":            STATUS_DISPLAY[s],
+            "SOD Count":        sod_n,
+            "Actioned Today":   actioned,
+            "Execution Rate %": rate,
+            "Current Count":    now_n,
+            "Change":           f"+{delta}" if delta > 0 else str(delta),
+        })
+
+    score_df = pd.DataFrame(scorecard_rows)
+    st.dataframe(score_df.set_index("Queue"), use_container_width=True, height=210)
+
+    st.divider()
+
+    # ── Execution rate bar chart ──────────────────────────────────────────────
+    st.markdown('<p class="section-header">Execution Rate by Queue</p>', unsafe_allow_html=True)
+
+    rate_fig = go.Figure()
+    for row in scorecard_rows:
+        rate_fig.add_trace(go.Bar(
+            name=row["Queue"],
+            x=[row["Queue"]],
+            y=[row["Execution Rate %"]],
+            marker_color=STATUS_COLORS.get(
+                next(k for k, v in STATUS_DISPLAY.items() if v == row["Queue"]), "#ccc"
+            ),
+            text=[f"{row['Execution Rate %']}%"],
+            textposition="outside",
+        ))
+    rate_fig.add_hline(y=50, line_dash="dot", line_color="#aaa",
+                       annotation_text="50% target", annotation_position="top right")
+    rate_fig.update_layout(
+        height=320,
+        showlegend=False,
+        yaxis=dict(range=[0, 110], ticksuffix="%", showgrid=True, gridcolor="#f0f0f0"),
+        plot_bgcolor="white", paper_bgcolor="white",
+        margin=dict(l=0, r=0, t=20, b=0),
+    )
+    st.plotly_chart(rate_fig, use_container_width=True)
+
+    st.divider()
+
+    # ── SOD vs Now vs Actioned comparison ─────────────────────────────────────
+    st.markdown('<p class="section-header">SOD vs Current vs Actioned</p>', unsafe_allow_html=True)
+
+    compare_fig = go.Figure()
+    queue_labels = [STATUS_DISPLAY[s] for s in STATUS_KEYS]
+    compare_fig.add_trace(go.Bar(
+        name="SOD Queue", x=queue_labels,
+        y=[sod_counts[s] for s in STATUS_KEYS],
+        marker_color="#BDC3C7",
+    ))
+    compare_fig.add_trace(go.Bar(
+        name="Current Queue", x=queue_labels,
+        y=[now_counts[s] for s in STATUS_KEYS],
+        marker_color="#2F5496",
+    ))
+    compare_fig.add_trace(go.Bar(
+        name="Actioned Today", x=queue_labels,
+        y=[today_actions.get(ACTION_FOR_STATUS[s], 0) for s in STATUS_KEYS],
+        marker_color="#27AE60",
+    ))
+    compare_fig.update_layout(
+        barmode="group", height=340,
+        plot_bgcolor="white", paper_bgcolor="white",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        margin=dict(l=0, r=0, t=40, b=0),
+        yaxis=dict(showgrid=True, gridcolor="#f0f0f0"),
+    )
+    st.plotly_chart(compare_fig, use_container_width=True)
+
+    # ── Per-inbox breakdown ───────────────────────────────────────────────────
+    st.divider()
+    st.markdown('<p class="section-header">Per-Inbox SOD Breakdown</p>', unsafe_allow_html=True)
+
+    inbox_rows = []
+    for inbox in INBOXES:
+        row_data = {"Inbox": inbox.replace("@rootlabs.co", "")}
+        for s in STATUS_KEYS:
+            row_data[STATUS_DISPLAY[s]] = sum(
+                1 for r in sod_snapshot.values()
+                if r["thread_status"] == s and r["rootlabs_inbox"] == inbox
+            )
+        row_data["SOD Total"] = sum(row_data[STATUS_DISPLAY[s]] for s in STATUS_KEYS)
+        if row_data["SOD Total"] > 0:
+            inbox_rows.append(row_data)
+
+    if inbox_rows:
+        inbox_score_df = pd.DataFrame(inbox_rows).sort_values("SOD Total", ascending=False)
+        st.dataframe(inbox_score_df.set_index("Inbox"), use_container_width=True, height=300)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # PAGE 1: Queue Overview
 # ══════════════════════════════════════════════════════════════════════════════
 
-if page == "📊  Queue Overview":
+elif page == "📊  Queue Overview":
     st.title("📬 Queue Overview")
     st.caption(f"Snapshot date: **{snap_date}**  ·  {len(snap_df):,} active creator threads")
     st.divider()

@@ -169,6 +169,16 @@ def pull_snapshot():
     with open(snap_path, "w") as fh:
         json.dump(snapshot, fh, indent=2)
     print(f"  Snapshot saved: {snap_path} ({len(snapshot)} creator records)")
+
+    # Save immutable SOD baseline (never overwritten once created for the day)
+    sod_path = os.path.join(SNAPSHOT_DIR, f"snapshot_{today}_sod.json")
+    if not os.path.exists(sod_path):
+        with open(sod_path, "w") as fh:
+            json.dump(snapshot, fh, indent=2)
+        print(f"  SOD baseline saved: {sod_path}")
+    else:
+        print(f"  SOD baseline already exists for today: {sod_path}")
+
     return snapshot, today
 
 
