@@ -190,15 +190,6 @@ def pull_snapshot():
         json.dump(snapshot, fh, indent=2)
     print(f"  Snapshot saved: {snap_path} ({len(snapshot)} creator records)")
 
-    # Save immutable SOD baseline (never overwritten once created for the day)
-    sod_path = os.path.join(SNAPSHOT_DIR, f"snapshot_{today}_sod.json")
-    if not os.path.exists(sod_path):
-        with open(sod_path, "w") as fh:
-            json.dump(snapshot, fh, indent=2)
-        print(f"  SOD baseline saved: {sod_path}")
-    else:
-        print(f"  SOD baseline already exists for today: {sod_path}")
-
     return snapshot, today
 
 
@@ -615,18 +606,33 @@ if __name__ == "__main__":
     print("=" * 60)
 
     if eod_mode:
-        # ── EOD: save scorecard only, do not touch changelog ─────────────────
+        # ── EOD: compute scorecard vs last night's baseline, save _eod.json ──
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        sod_path = os.path.join(SNAPSHOT_DIR, f"snapshot_{today}_sod.json")
-        if not os.path.exists(sod_path):
-            print("ERROR: No SOD snapshot found for today. Run the morning tracker first.")
+        yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+
+        # Load baseline: prefer yesterday's EOD snapshot, fall back to today's SOD
+        baseline_path = os.path.join(SNAPSHOT_DIR, f"snapshot_{yesterday}_eod.json")
+        fallback_path = os.path.join(SNAPSHOT_DIR, f"snapshot_{today}_sod.json")
+        if os.path.exists(baseline_path):
+            with open(baseline_path) as fh:
+                sod_snap = json.load(fh)
+            print(f"  Baseline loaded: {yesterday} EOD ({len(sod_snap)} records)")
+        elif os.path.exists(fallback_path):
+            with open(fallback_path) as fh:
+                sod_snap = json.load(fh)
+            print(f"  Baseline loaded: today's SOD fallback ({len(sod_snap)} records)")
+        else:
+            print("ERROR: No baseline found (no yesterday _eod.json or today _sod.json).")
             sys.exit(1)
-        with open(sod_path) as fh:
-            sod_snap = json.load(fh)
-        print(f"  SOD baseline loaded: {len(sod_snap)} records")
 
         print("\nPulling current Airtable state for EOD diff...")
         curr_snapshot, _ = pull_snapshot()
+
+        # Save today's EOD snapshot (becomes tomorrow's baseline)
+        eod_path = os.path.join(SNAPSHOT_DIR, f"snapshot_{today}_eod.json")
+        with open(eod_path, "w") as fh:
+            json.dump(curr_snapshot, fh, indent=2)
+        print(f"  EOD snapshot saved: {eod_path} ({len(curr_snapshot)} records)")
 
         print("\nComputing EOD scorecard...")
         metrics = compute_scorecard_metrics(today, sod_snap, curr_snapshot)
@@ -635,7 +641,7 @@ if __name__ == "__main__":
         print(f"\n{'─' * 40}")
         print(f"  EOD Scorecard — {today}")
         print(f"{'─' * 40}")
-        print(f"  SOD total queue:   {metrics['sod_total']}")
+        print(f"  Baseline queue:    {metrics['sod_total']} (last night's EOD)")
         print(f"  New inbounds:      {metrics['new_inbounds']}")
         print(f"  Replies sent:      {metrics['replied']}  ({metrics['reply_rate_pct']}% of needs_reply)")
         print(f"  Followup 1 sent:   {metrics['followup_1_sent']}  ({metrics['fu1_rate_pct']}% of FU1 queue)")

@@ -110,14 +110,18 @@ def load_latest_snapshot():
 
 @st.cache_data(ttl=300)
 def load_sod_snapshot():
-    """Load today's SOD (start-of-day) baseline snapshot, if it exists."""
+    """Load baseline snapshot: yesterday's EOD, falling back to today's SOD."""
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+    eod_path = os.path.join(SNAPSHOT_DIR, f"snapshot_{yesterday}_eod.json")
     sod_path = os.path.join(SNAPSHOT_DIR, f"snapshot_{today}_sod.json")
-    if not os.path.exists(sod_path):
-        return {}, None
-    with open(sod_path) as f:
-        data = json.load(f)
-    return data, today
+    if os.path.exists(eod_path):
+        with open(eod_path) as f:
+            return json.load(f), yesterday
+    if os.path.exists(sod_path):
+        with open(sod_path) as f:
+            return json.load(f), today
+    return {}, None
 
 
 @st.cache_data(ttl=300)
@@ -326,12 +330,6 @@ def pull_fresh_snapshot():
     with open(snap_path, "w") as fh:
         json.dump(snapshot, fh, indent=2)
 
-    # Save immutable SOD baseline (never overwrite once created for the day)
-    sod_path = os.path.join(SNAPSHOT_DIR, f"snapshot_{today}_sod.json")
-    if not os.path.exists(sod_path):
-        with open(sod_path, "w") as fh:
-            json.dump(snapshot, fh, indent=2)
-
     return snapshot, today
 
 
@@ -379,16 +377,6 @@ with st.sidebar:
         st.success("Data refreshed!")
         st.rerun()
 
-    if st.button("📍  Reset SOD Baseline to Now", use_container_width=True,
-                 help="Use after bulk Airtable updates. Re-anchors today's start-of-day baseline to current live data."):
-        with st.spinner("Pulling live data and resetting SOD baseline..."):
-            snapshot, today = pull_fresh_snapshot()
-            sod_path = os.path.join(SNAPSHOT_DIR, f"snapshot_{today}_sod.json")
-            with open(sod_path, "w") as fh:
-                json.dump(snapshot, fh, indent=2)
-        st.cache_data.clear()
-        st.success(f"SOD baseline reset to {len(snapshot):,} threads.")
-        st.rerun()
 
     st.divider()
     page = st.radio(
@@ -400,18 +388,22 @@ with st.sidebar:
     st.divider()
 
     if st.button("🔒  Lock EOD Scorecard", use_container_width=True,
-                 help="Save today's execution metrics to the historical record"):
+                 help="Save today's execution metrics and lock tonight's baseline for tomorrow"):
         today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        sod_snap, _ = load_sod_snapshot()
+        baseline_snap, _ = load_sod_snapshot()
         curr_snap, _ = load_latest_snapshot()
-        if not sod_snap:
-            st.warning("No SOD baseline for today — refresh first.")
+        if not baseline_snap:
+            st.warning("No baseline found — refresh from Airtable first.")
         else:
-            metrics = write_scorecard_row(today_str, sod_snap, curr_snap)
+            metrics = write_scorecard_row(today_str, baseline_snap, curr_snap)
+            # Save tonight's EOD snapshot as tomorrow's baseline
+            eod_path = os.path.join(SNAPSHOT_DIR, f"snapshot_{today_str}_eod.json")
+            with open(eod_path, "w") as fh:
+                json.dump(curr_snap, fh, indent=2)
             st.cache_data.clear()
             st.success(
-                f"Scorecard locked for {today_str}: "
-                f"{metrics['total_actioned']} actioned / {metrics['sod_total']} SOD "
+                f"EOD locked for {today_str}: "
+                f"{metrics['total_actioned']} actioned / {metrics['sod_total']} baseline "
                 f"({metrics['overall_rate_pct']}%)"
             )
             st.rerun()
@@ -442,14 +434,15 @@ snap_df = snap_df[snap_df["thread_status"].isin([
 if page == "📅  Today's Scorecard":
     st.title("📅 Today's Scorecard")
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    st.caption(f"Date: **{today_str}**  ·  Measures execution from SOD baseline to now")
+    st.caption(f"Date: **{today_str}**  ·  Measures execution since last night's EOD baseline")
     st.divider()
 
     if not sod_snapshot:
         st.warning(
-            "No SOD baseline found for today. "
-            "Click **Refresh from Airtable** once — it will save today's baseline automatically. "
-            "From tomorrow onward, the 8am scheduled run sets the baseline."
+            "No baseline found. "
+            "The baseline is set automatically each night at 8pm when the EOD scorecard locks. "
+            "If it's early in the day, yesterday's EOD snapshot may be missing — "
+            "click **Lock EOD Scorecard** tonight to establish it."
         )
         st.stop()
 
