@@ -53,9 +53,14 @@ NON_CREATOR_DOMAINS = {
 
 INBOXES = [
     "may_k@rootlabs.co", "may.k@rootlabs.co", "founder@rootlabs.co",
-    "may.kumar@rootlabs.co", "mayank.k@rootlabs.co", "mayank.kumar@rootlabs.co",
+    "may.kumar@rootlabs.co", "mayank.k@rootlabs.co",
     "may@rootlabs.co", "ceo@rootlabs.co", "mayk@rootlabs.co",
 ]
+
+# Inboxes permanently excluded from the dashboard (all threads hidden regardless of Airtable status)
+EXCLUDED_INBOXES = {
+    "mayank.kumar@rootlabs.co",
+}
 
 STATUS_COLOURS = {
     "needs_reply":       "#E74C3C",
@@ -297,6 +302,9 @@ def pull_fresh_snapshot():
         if domain in NON_CREATOR_DOMAINS:
             continue
         if (f.get("action_status_manual") or "") == "needs_no_action":
+            continue
+        inbox = (f.get("rootlabs_email") or "").strip().lower()
+        if inbox in EXCLUDED_INBOXES:
             continue
         thread_status = (f.get("thread_status") or "").strip()
         if not thread_status:

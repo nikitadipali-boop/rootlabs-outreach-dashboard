@@ -73,9 +73,14 @@ NON_CREATOR_DOMAINS = {
 
 INBOXES = [
     "may_k@rootlabs.co", "may.k@rootlabs.co", "founder@rootlabs.co",
-    "may.kumar@rootlabs.co", "mayank.k@rootlabs.co", "mayank.kumar@rootlabs.co",
+    "may.kumar@rootlabs.co", "mayank.k@rootlabs.co",
     "may@rootlabs.co", "ceo@rootlabs.co", "mayk@rootlabs.co",
 ]
+
+# Inboxes permanently excluded from all snapshots and reports
+EXCLUDED_INBOXES = {
+    "mayank.kumar@rootlabs.co",
+}
 
 # ── Styles ────────────────────────────────────────────────────────────────────
 
@@ -162,11 +167,17 @@ def pull_snapshot():
         manual = f.get("action_status_manual") or ""
         if manual == "needs_no_action":
             continue
+        inbox = (f.get("rootlabs_email") or "").strip().lower()
+        if inbox in EXCLUDED_INBOXES:
+            continue
+        thread_status = (f.get("thread_status") or "").strip()
+        if not thread_status:
+            continue
         snapshot[r["id"]] = {
             "record_id":          r["id"],
             "creator_email":      email,
             "rootlabs_inbox":     (f.get("rootlabs_email") or "").strip(),
-            "thread_status":      (f.get("thread_status") or "").strip(),
+            "thread_status":      thread_status,
             "action_status_final":(f.get("action_status_final") or "").strip(),
             "last_message_type":  (f.get("last_message_type") or "").strip(),
             "last_message_date":  (f.get("last_message_date") or "")[:19],
@@ -193,10 +204,14 @@ def pull_snapshot():
 
 # ── Step 2: Load yesterday's snapshot ────────────────────────────────────────
 
+def _is_daily_snapshot(fname):
+    import re
+    return bool(re.match(r'^snapshot_\d{4}-\d{2}-\d{2}\.json$', fname))
+
 def load_previous_snapshot(today):
     files = sorted([
         f for f in os.listdir(SNAPSHOT_DIR)
-        if f.startswith("snapshot_") and f.endswith(".json") and f != f"snapshot_{today}.json"
+        if _is_daily_snapshot(f) and f != f"snapshot_{today}.json"
     ], reverse=True)
     if not files:
         print("  No previous snapshot found - this is the baseline run.")
